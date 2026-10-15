@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading-Tool</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e1117; --panel: #161b22; --line: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --up: #26a69a; --down: #ef5350; --accent: #2f81f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .group { display: flex; align-items: center; gap: 6px; }
+  label { color: var(--muted); font-size: 12px; }
+  select, input[type=number], button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; font-size: 14px;
+  }
+  input[type=number] { width: 64px; }
+  button { cursor: pointer; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .intervals { display: flex; gap: 4px; }
+  .spacer { flex: 1; }
+  #price { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #dot.ok { background: var(--up); }
+  #dot.warn { background: #d29922; }
+  #dot.err { background: var(--down); }
+  main { flex: 1; min-height: 320px; position: relative; }
+  #chart { position: absolute; inset: 0; }
+  footer {
+    display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: baseline;
+    padding: 10px 14px; background: var(--panel); border-top: 1px solid var(--line);
+  }
+  .stat span { display: block; color: var(--muted); font-size: 11px; }
+  .stat b { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--up); } .neg { color: var(--down); }
+  #note { flex-basis: 100%; color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="group">
+    <label for="market">Markt</label>
+    <select id="market"></select>
+  </div>
+  <div class="intervals" id="intervals"></div>
+  <div class="group">
+    <label for="fast">SMA</label>
+    <input id="fast" type="number" min="2" max="200" value="20" title="schneller SMA">
+    <input id="slow" type="number" min="3" max="400" value="50" title="langsamer SMA">
+  </div>
+  <div class="group">
+    <input id="strategy" type="checkbox" checked>
+    <label for="strategy">Signale anzeigen</label>
+  </div>
+  <div class="spacer"></div>
+  <div id="price">–</div>
+  <div id="status"><span id="dot"></span><span id="statusText">Lade …</span></div>
+  <button id="logout">Abmelden</button>
+</header>
+
+<main><div id="chart"></div></main>
+
+<footer id="stats">
+  <div id="note">Backtest auf den letzten 1000 Kerzen · Long-only · 0,1 % Gebühr je Seite · keine Slippage · nur abgeschlossene Trades · keine Anlageberatung.</div>
+</footer>
+
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(() => {
+  const state = { symbol: 'BTCUSDT', interval: '1h', fast: 20, slow: 50, signals: true };
+  try { Object.assign(state, JSON.parse(localStorage.getItem('tt-state') || '{}')); } catch (e) {}
+  const save = () => { try { localStorage.setItem('tt-state', JSON.stringify(state)); } catch (e) {} };
+
+  const $ = (id) => document.getElementById(id);
+  const UP = '#26a69a', DOWN = '#ef5350';
+
+  // ---- Chart ----------------------------------------------------------
+  const chart = LightweightCharts.createChart($('chart'), {
+    autoSize: true,
+    layout: { background: { color: '#0e1117' }, textColor: '#c9d1d9' },
+    grid: { vertLines: { color: '#1b212b' }, horzLines: { color: '#1b212b' } },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const candles = chart.addCandlestickSeries({
+    upColor: UP, downColor: DOWN, borderUpColor: UP, borderDownColor: DOWN,
+    wickUpColor: UP, wickDownColor: DOWN,
+  });
+  const volume = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: '' });
+  volume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  const fastLine = chart.addLineSeries({ color: '#58a6ff', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+  const slowLine = chart.addLineSeries({ color: '#d29922', lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+
+  const volColor = (o, c) => (c >= o ? 'rgba(38,166,154,.45)' : 'rgba(239,83,80,.45)');
+  const fmt = (n) => n.toLocaleString('de-DE', { maximumFractionDigits: n < 10 ? 4 : 2 });
+
+  function setStatus(text, kind) {
+    $('statusText').textContent = text;
+    $('dot').className = kind || '';
+  }
+
+  // ---- Daten laden ----------------------------------------------------
+  async function loadData(fit) {
+    const q = new URLSearchParams({
+      symbol: state.symbol, interval: state.interval, fast: state.fast, slow: state.slow,
+    });
+    let r;
+    try { r = await fetch('/api/data?' + q); }
+    catch (e) { setStatus('Server nicht erreichbar', 'err'); return; }
+    if (r.status === 401) { location.href = '/login'; return; }
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      setStatus(d.detail || 'Fehler beim Laden', 'err');
+      return;
+    }
+    const d = await r.json();
+    if (d.symbol !== state.symbol || d.interval !== state.interval) return; // inzwischen gewechselt
+
+    candles.setData(d.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+    volume.setData(d.candles.map((c) => ({ time: c.time, value: c.volume, color: volColor(c.open, c.close) })));
+    fastLine.setData(d.fast);
+    slowLine.setData(d.slow);
+    lastMarkers = d.markers.map((m) => m.side === 'buy'
+      ? { time: m.time, position: 'belowBar', color: UP, shape: 'arrowUp', text: 'Kauf' }
+      : { time: m.time, position: 'aboveBar', color: DOWN, shape: 'arrowDown', text: 'Verkauf' });
+    applyMarkers();
+    renderStats(d.stats);
+    const last = d.candles[d.candles.length - 1];
+    if (last) $('price').textContent = fmt(last.close);
+    if (fit) chart.timeScale().fitContent();
+  }
+
+  let lastMarkers = [];
+  function applyMarkers() { candles.setMarkers(state.signals ? lastMarkers : []); }
+
+  function stat(label, value, cls) {
+    return `<div class="stat"><span>${label}</span><b class="${cls || ''}">${value}</b></div>`;
+  }
+  const pct = (v) => (v === null || v === undefined ? '–' : v.toLocaleString('de-DE') + ' %');
+  const sign = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '');
+
+  function renderStats(s) {
+    const note = $('note');
+    $('stats').innerHTML =
+      stat('Trades', s.trades) +
+      stat('Trefferquote', pct(s.win_rate_pct)) +
+      stat('Strategie', pct(s.return_pct), sign(s.return_pct)) +
+      stat('Buy &amp; Hold', pct(s.buy_hold_pct), sign(s.buy_hold_pct)) +
+      stat('Max. Drawdown', pct(s.max_drawdown_pct), s.max_drawdown_pct > 0 ? 'neg' : '') +
+      stat('Offene Position', s.open_position ? 'ja' : 'nein');
+    $('stats').appendChild(note);
+  }
+
+  // ---- Live-Stream ----------------------------------------------------
+  let ws = null, wsTimer = null, wsGen = 0;
+  function connect() {
+    const gen = ++wsGen;
+    clearTimeout(wsTimer);
+    if (ws) { ws.onclose = null; ws.close(); }
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const q = new URLSearchParams({ symbol: state.symbol, interval: state.interval });
+    ws = new WebSocket(`${proto}://${location.host}/ws/live?${q}`);
+    ws.onopen = () => { if (gen === wsGen) setStatus('Live', 'ok'); };
+    ws.onmessage = (e) => {
+      if (gen !== wsGen) return;
+      const k = JSON.parse(e.data);
+      candles.update({ time: k.time, open: k.open, high: k.high, low: k.low, close: k.close });
+      volume.update({ time: k.time, value: k.volume, color: volColor(k.open, k.close) });
+      $('price').textContent = fmt(k.close);
+      if (k.closed) loadData(false); // Linien, Signale, Kennzahlen neu berechnen
+    };
+    ws.onclose = () => {
+      if (gen !== wsGen) return;
+      setStatus('Getrennt – verbinde neu …', 'warn');
+      wsTimer = setTimeout(connect, 3000);
+    };
+  }
+
+  function reload() {
+    setStatus('Lade …');
+    candles.setData([]); volume.setData([]); fastLine.setData([]); slowLine.setData([]);
+    $('price').textContent = '–';
+    loadData(true);
+    connect();
+  }
+
+  // ---- Bedienelemente -------------------------------------------------
+  function renderIntervals(list) {
+    const box = $('intervals');
+    box.innerHTML = '';
+    list.forEach((iv) => {
+      const b = document.createElement('button');
+      b.textContent = iv;
+      b.className = iv === state.interval ? 'active' : '';
+      b.onclick = () => {
+        state.interval = iv; save();
+        box.querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+        reload();
+      };
+      box.appendChild(b);
+    });
+  }
+
+  async function init() {
+    const r = await fetch('/api/markets');
+    if (r.status === 401) { location.href = '/login'; return; }
+    const cfg = await r.json();
+    if (!cfg.markets.some((m) => m.symbol === state.symbol)) state.symbol = cfg.markets[0].symbol;
+    if (!cfg.intervals.includes(state.interval)) state.interval = cfg.intervals[0];
+
+    const sel = $('market');
+    cfg.markets.forEach((m) => {
+      const o = document.createElement('option');
+      o.value = m.symbol; o.textContent = m.name;
+      sel.appendChild(o);
+    });
+    sel.value = state.symbol;
+    sel.onchange = () => { state.symbol = sel.value; save(); reload(); };
+
+    renderIntervals(cfg.intervals);
+
+    $('fast').value = state.fast; $('slow').value = state.slow;
+    $('strategy').checked = state.signals;
+    const onSma = () => {
+      const f = parseInt($('fast').value, 10), s = parseInt($('slow').value, 10);
+      if (!(f >= 2 && s > f)) { setStatus('Schneller SMA muss kleiner als der langsame sein', 'warn'); return; }
+      state.fast = f; state.slow = s; save(); loadData(false);
+    };
+    $('fast').onchange = onSma; $('slow').onchange = onSma;
+    $('strategy').onchange = () => { state.signals = $('strategy').checked; save(); applyMarkers(); };
+    $('logout').onclick = async () => { await fetch('/api/logout', { method: 'POST' }); location.href = '/login'; };
+
+    reload();
+  }
+  init();
+})();
+</script>
+</body>
+</html>
